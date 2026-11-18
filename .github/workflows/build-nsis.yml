@@ -1,4 +1,8 @@
-name: Build Setup EXE
+name: Build NSIS Setup EXE (Offline-ready)
+
+# Builds installer that embeds Python + core pip packages so end users
+# only need to add GGUF models (no internet required after install).
+# Team: Mehdi Tariri · Mohsen Tarifii
 
 on:
   push:
@@ -10,36 +14,130 @@ permissions:
   contents: write
 
 jobs:
-  installer:
+  nsis:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Inno Setup
+      - name: Build offline embedded Python (amd64) + packages
         shell: pwsh
         run: |
-          choco install innosetup -y --no-progress
-          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
-            throw "ISCC.exe not found"
+          $ErrorActionPreference = "Stop"
+          $payload = "installer\payload"
+          $offline = "installer\payload\python-offline-amd64"
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          New-Item -ItemType Directory -Force -Path $offline | Out-Null
+
+          $ver = "3.11.9"
+          $zipName = "python-$ver-embed-amd64.zip"
+          $zipPath = Join-Path $payload $zipName
+          $url = "https://www.python.org/ftp/python/$ver/$zipName"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile (Join-Path $payload "get-pip.py") -UseBasicParsing
+
+          # Extract embed into offline folder
+          Expand-Archive -Path $zipPath -DestinationPath $offline -Force
+
+          # Enable site-packages in embeddable distro
+          $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
+          if ($pth) {
+            $content = Get-Content $pth.FullName
+            $content = $content | ForEach-Object {
+              if ($_ -match '^#\s*import site') { 'import site' }
+              elseif ($_ -match '^import site') { $_ }
+              else { $_ }
+            }
+            if ($content -notcontains 'import site') { $content += 'import site' }
+            # ensure Lib\site-packages path
+            if (-not ($content -match 'site-packages')) { $content += 'Lib\site-packages' }
+            Set-Content -Path $pth.FullName -Value $content
+            Write-Host "Patched $($pth.Name)"
           }
 
-      - name: Compile installer
+          $py = Join-Path $offline "python.exe"
+          & $py (Join-Path $payload "get-pip.py") --no-warn-script-location
+          & $py -m pip install --upgrade pip wheel setuptools --no-warn-script-location
+
+          # Core offline packages for Desktop Chat + Agent
+          $pkgs = @(
+            "customtkinter",
+            "requests",
+            "pypdf",
+            "Pillow",
+            "numpy"
+          )
+          foreach ($pkg in $pkgs) {
+            Write-Host "pip install $pkg"
+            & $py -m pip install $pkg --no-warn-script-location
+          }
+
+          # llama-cpp-python (CPU) — may take time; required for GGUF
+          Write-Host "pip install llama-cpp-python (CPU wheel if available)"
+          try {
+            $env:CMAKE_ARGS = ""
+            & $py -m pip install "llama-cpp-python" --no-warn-script-location
+          } catch {
+            Write-Host "WARN llama-cpp-python: $($_.Exception.Message)"
+          }
+
+          # Optional lighter deps (skip heavy sentence-transformers in offline bundle to keep size sane)
+          & $py -m pip install "pypdf" "Pillow" --no-warn-script-location
+
+          Write-Host "Offline python tree size:"
+          Get-ChildItem $offline -Recurse | Measure-Object -Property Length -Sum | ForEach-Object { "{0:N0} bytes" -f $_.Sum }
+          & $py -c "import sys; print(sys.version)"
+          & $py -c "import customtkinter; print('customtkinter OK')"
+          try { & $py -c "import llama_cpp; print('llama_cpp OK')" } catch { Write-Host "WARN llama_cpp import failed" }
+
+          # Also keep zip copies for Win7/32 fallback (download only, not fully pip-baked)
+          $extras = @(
+            "https://www.python.org/ftp/python/3.8.10/python-3.8.10-embed-amd64.zip",
+            "https://www.python.org/ftp/python/3.8.10/python-3.8.10-embed-win32.zip",
+            "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-win32.zip"
+          )
+          foreach ($u in $extras) {
+            $n = Split-Path $u -Leaf
+            $out = Join-Path $payload $n
+            if (-not (Test-Path $out)) {
+              try { Invoke-WebRequest -Uri $u -OutFile $out -UseBasicParsing } catch { Write-Host "WARN $n" }
+            }
+          }
+
+      - name: Install NSIS
         shell: pwsh
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\GGUF-Runner.iss"
-          Get-ChildItem installer\Output\
+          choco install nsis -y --no-progress
+          $makensis = @(
+            "C:\Program Files (x86)\NSIS\makensis.exe",
+            "C:\Program Files\NSIS\makensis.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) { throw "makensis not found" }
+          echo "MAKENSIS=$makensis" >> $env:GITHUB_ENV
 
-      - name: Upload Setup EXE
-        uses: actions/upload-artifact@v4
+      - name: Compile NSIS
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer\Output | Out-Null
+          Set-Location installer
+          & "$env:MAKENSIS" /V2 GGUF-Runner.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          Get-ChildItem Output\ | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: GGUF-Runner-Setup
+          name: GGUF-Runner-NSIS-Setup
           path: installer/Output/GGUF-Runner-Setup-*.exe
 
-      - name: Attach to Release
+      - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: installer/Output/GGUF-Runner-Setup-*.exe
           generate_release_notes: true
+          body: |
+            Offline-ready installer (Python + core libs embedded).
+            Add your `.gguf` files to the `models` folder after install.
+            Team: Mehdi Tariri · Mohsen Tarifii
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
